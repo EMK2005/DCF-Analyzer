@@ -116,8 +116,10 @@ def upload_page():
         if extract_btn:
             with st.spinner("Reading the filing... This takes 30–60 seconds depending on file size."):
                 try:
+                    raw_bytes = uploaded_file.getvalue()
+                    st.session_state.pdf_bytes = raw_bytes  # store for AI Analysis tab
                     financials = extract_financials_from_pdf(
-                        uploaded_file.read(),
+                        raw_bytes,
                         st.session_state.api_key
                     )
                     st.session_state.financials = financials
@@ -155,7 +157,8 @@ def extract_financials_from_pdf(pdf_bytes: bytes, api_key: str) -> dict:
     """Send PDF to Claude API and extract structured financials."""
     client = anthropic.Anthropic(api_key=api_key)
 
-    pdf_b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+    # Safely encode binary PDF — base64 output is always ASCII-safe
+    pdf_b64 = base64.b64encode(pdf_bytes).decode("ascii")
 
     prompt = """You are a financial analyst. Extract key financial data from this 10-K annual report filing.
 
@@ -335,7 +338,11 @@ def preview_page():
             new_ni = st.number_input("Net Income ($M)", value=float(safe(inc.get("net_income", [0,0,0]), 2)), step=100.0)
         with c3:
             new_da = st.number_input("D&A ($M)", value=float(safe(inc.get("depreciation_amortization", [0,0,0]), 2)), step=50.0)
-            new_tax = st.number_input("Tax Rate (%)", value=float((inc.get("tax_rate") or 0.21) * 100), step=0.5, min_value=0.0, max_value=60.0)
+            raw_tax = float(inc.get("tax_rate") or 0.21)
+            # Normalize: Claude sometimes returns 21 instead of 0.21
+            tax_display = raw_tax if raw_tax > 1 else raw_tax * 100
+            tax_display = max(0.0, min(tax_display, 60.0))
+            new_tax = st.number_input("Tax Rate (%)", value=tax_display, step=0.5, min_value=0.0, max_value=60.0)
 
         # Push edits back
         if inc.get("revenue") and len(inc["revenue"]) == 3:
@@ -450,7 +457,8 @@ def preview_page():
             new_dw = st.number_input("Debt Weight (%)", value=float((wacc_in.get("debt_weight") or 0.35) * 100), step=1.0, min_value=0.0, max_value=100.0)
             new_ew = st.number_input("Equity Weight (%)", value=100 - float((wacc_in.get("debt_weight") or 0.35) * 100), step=1.0, min_value=0.0, max_value=100.0)
 
-        tax_rate = fin["income_statement"].get("tax_rate") or 0.21
+        raw_tr = fin["income_statement"].get("tax_rate") or 0.21
+        tax_rate = raw_tr / 100 if raw_tr > 1 else raw_tr
         auto_wacc = (new_ew / 100) * (new_rfr / 100 + new_beta * new_mrp / 100) + \
                     (new_dw / 100) * (new_cod / 100) * (1 - tax_rate)
 
@@ -513,7 +521,8 @@ def dcf_page():
     base_da = safe(inc.get("depreciation_amortization", [0,0,0]), 2)
     base_fcf = safe(cf.get("free_cash_flow", [0,0,0]), 2)
     base_capex = safe(cf.get("capex", [0,0,0]), 2)
-    tax_rate = inc.get("tax_rate") or 0.21
+    raw_tr = inc.get("tax_rate") or 0.21
+    tax_rate = raw_tr / 100 if raw_tr > 1 else raw_tr
     net_debt = bs.get("net_debt") or 0
     shares = bs.get("shares_outstanding") or 1
 
@@ -631,7 +640,7 @@ def dcf_page():
     st.markdown("<br>", unsafe_allow_html=True)
 
     # ── TABS ──
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Projections", "💰 Valuation Bridge", "🗺️ Sensitivity", "📋 Full Table"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Projections", "💰 Valuation Bridge", "🗺️ Sensitivity", "📋 Full Table", "🧠 AI Analysis"])
 
     plotly_layout = dict(
         paper_bgcolor="#0f1117",
@@ -949,3 +958,200 @@ def dcf_page():
             '<div class="warning-box" style="margin-top:1rem;">⚠️ This model is for educational purposes. DCF outputs are highly sensitive to assumptions. Always cross-check with comparable company analysis, precedent transactions, and your own judgment. Not investment advice.</div>',
             unsafe_allow_html=True
         )
+
+    # ── TAB 5: AI ANALYSIS ──
+    with tab5:
+        st.markdown("#### 🧠 AI Analysis of the 10-K")
+        st.markdown(
+            '<div class="info-box">Claude reads the full filing and produces a structured qualitative analysis — key risks, growth opportunities, competitive position, and what to watch. Click the button to generate.</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # Analysis type selector
+        analysis_type = st.radio(
+            "Analysis focus",
+            ["Full Report", "Risks Only", "Opportunities Only", "DCF Assumptions Sanity Check"],
+            horizontal=True,
+        )
+
+        if st.button("🧠 Generate AI Analysis", type="primary", use_container_width=False):
+            api_key = st.session_state.get("api_key", "")
+            pdf_bytes = st.session_state.get("pdf_bytes")
+
+            if not api_key:
+                st.error("No API key found. Go back to Home and enter your key.")
+            else:
+                # Build a context-rich prompt using the already-extracted financials
+                fin_summary = f"""
+Company: {company} ({ticker})
+Fiscal Year: {fiscal_year}
+Revenue (latest): ${base_revenue:,.0f}M
+EBITDA (latest): ${base_ebitda:,.0f}M  
+EBITDA Margin: {base_ebitda/base_revenue*100:.1f}% if base_revenue else 'N/A'
+Net Income (latest): ${safe(inc.get('net_income',[0,0,0]),2):,.0f}M
+FCF (latest): ${base_fcf:,.0f}M
+Net Debt: ${net_debt:,.0f}M
+Shares Outstanding: {shares:,.0f}M
+Current Price: ${current_price:.2f}
+DCF Implied Price (avg): ${avg_implied_price:.2f} ({updown:+.1f}% vs market)
+WACC used: {wacc*100:.2f}%
+Revenue Growth Assumption: {rev_growth*100:.1f}%/yr
+Terminal Growth Rate: {tgr*100:.2f}%
+Exit Multiple: {exit_mult:.1f}x EV/EBITDA
+"""
+
+                prompts = {
+                    "Full Report": f"""You are a senior equity analyst. Based on the 10-K filing for {company} and the financial summary below, write a structured investment analysis report.
+
+Financial Summary:
+{fin_summary}
+
+Structure your response with these sections using markdown headers:
+
+## Executive Summary
+2-3 sentence overview of the company's position and the filing's key takeaways.
+
+## Business Model & Competitive Position
+How the company makes money. Key moats or competitive advantages. Market position.
+
+## Key Risks
+List the top 5 material risks from the filing. For each: name, description, and severity (High/Medium/Low).
+
+## Growth Opportunities
+List the top 4-5 growth drivers or opportunities mentioned in the filing. Be specific.
+
+## Financial Health Assessment
+Comment on balance sheet strength, cash generation quality, and capital allocation.
+
+## DCF Assumptions Sanity Check
+Given the financial summary and DCF assumptions above, comment on whether the growth rate ({rev_growth*100:.1f}%), WACC ({wacc*100:.2f}%), and terminal growth rate ({tgr*100:.2f}%) seem reasonable for this company. Flag anything that looks aggressive or conservative.
+
+## Key Things to Watch
+3-4 specific metrics, events, or catalysts to monitor over the next 12-24 months.
+
+Be analytical and specific. Reference actual numbers from the filing where possible. Do not be generic.""",
+
+                    "Risks Only": f"""You are a senior equity analyst. Based on the 10-K filing for {company}, produce a detailed risk analysis.
+
+Financial context:
+{fin_summary}
+
+## Risk Analysis — {company}
+
+Identify and analyze the top 7 material risks from this 10-K. For each risk:
+- **Risk Name** (severity: High / Medium / Low)
+- What the risk is and why it matters
+- How exposed {company} specifically is to this risk
+- Any mitigants the company has in place
+
+Group them by category: Operational, Financial, Regulatory/Legal, Market/Competitive, Macro.
+
+Be specific and analytical. Reference the filing's own language and disclosures.""",
+
+                    "Opportunities Only": f"""You are a growth equity analyst. Based on the 10-K filing for {company}, identify and analyze the top growth opportunities.
+
+Financial context:
+{fin_summary}
+
+## Growth Opportunities — {company}
+
+Identify the top 6 growth opportunities or catalysts mentioned or implied in this filing. For each:
+- **Opportunity Name**
+- Description and strategic rationale
+- Timeline (near-term 1-2yr / medium-term 3-5yr / long-term 5yr+)
+- Potential revenue or margin impact
+- Key risks to this opportunity materializing
+
+End with a brief view on which 2 opportunities have the highest probability of driving meaningful upside.""",
+
+                    "DCF Assumptions Sanity Check": f"""You are a valuation expert. Based on the 10-K filing for {company} and the DCF model assumptions below, critically evaluate whether the assumptions are reasonable.
+
+DCF Model Summary:
+{fin_summary}
+
+## DCF Assumptions Review — {company}
+
+Evaluate each assumption:
+
+### Revenue Growth ({rev_growth*100:.1f}% per year)
+Is this reasonable given the company's historical growth, market position, and industry dynamics? What does the filing suggest about future growth?
+
+### EBITDA Margin ({ebitda_margin*100:.1f}%)
+Is this margin sustainable or achievable? What does the filing say about cost structure and margin trends?
+
+### WACC ({wacc*100:.2f}%)
+Is this appropriate for this company's risk profile, capital structure, and sector?
+
+### Terminal Growth Rate ({tgr*100:.2f}%)
+Is this a reasonable long-run growth assumption for this business?
+
+### Exit Multiple ({exit_mult:.1f}x EV/EBITDA)
+Is this a fair multiple given peers and sector norms?
+
+### Overall Assessment
+Bull case / Base case / Bear case implied prices and what assumptions drive each scenario.
+Verdict: does the current market price of ${current_price:.2f} look attractive, fair, or expensive relative to the DCF range?""",
+                }
+
+                selected_prompt = prompts[analysis_type]
+
+                with st.spinner(f"Generating {analysis_type}... this takes 15–30 seconds."):
+                    try:
+                        import anthropic as ant
+                        client = ant.Anthropic(api_key=api_key)
+
+                        # If we have the raw PDF bytes, send them for richer analysis
+                        pdf_bytes = st.session_state.get("pdf_bytes")
+                        if pdf_bytes:
+                            pdf_b64 = base64.b64encode(pdf_bytes).decode("ascii")
+                            messages = [{
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "document",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": "application/pdf",
+                                            "data": pdf_b64,
+                                        },
+                                    },
+                                    {"type": "text", "text": selected_prompt},
+                                ],
+                            }]
+                        else:
+                            # Fallback: use extracted financials only (no PDF re-read)
+                            messages = [{"role": "user", "content": selected_prompt}]
+
+                        response = client.messages.create(
+                            model="claude-sonnet-4-6",
+                            max_tokens=2500,
+                            messages=messages,
+                        )
+                        analysis_text = response.content[0].text
+                        st.session_state["last_analysis"] = analysis_text
+                        st.session_state["last_analysis_type"] = analysis_type
+
+                    except Exception as e:
+                        st.error(f"Analysis failed: {str(e)}")
+
+        # Display last generated analysis
+        if st.session_state.get("last_analysis"):
+            st.markdown("---")
+            st.markdown(
+                f'<div class="status-badge badge-done">✓ {st.session_state.get("last_analysis_type", "Analysis")} generated</div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown(st.session_state["last_analysis"])
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.download_button(
+                "⬇️ Download Analysis as .txt",
+                data=st.session_state["last_analysis"],
+                file_name=f"{company}_{st.session_state.get('last_analysis_type','analysis').replace(' ','_')}.txt",
+                mime="text/plain",
+            )
+            st.markdown(
+                '<div class="warning-box" style="margin-top:1rem;">⚠️ AI-generated analysis. Not investment advice. Always verify claims against the original filing and consult a qualified financial advisor before making investment decisions.</div>',
+                unsafe_allow_html=True,
+            )
