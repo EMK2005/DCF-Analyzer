@@ -5,6 +5,33 @@ import base64
 
 
 # ─────────────────────────────────────────────
+# MODULE-LEVEL HELPERS (shared across pages)
+# ─────────────────────────────────────────────
+
+def normalize_tax(raw):
+    """Return tax rate as a decimal (0–1). Handles 0.21, 21.0, and 1790 formats."""
+    if raw is None:
+        return 0.21
+    raw = float(raw)
+    if raw > 1:
+        return raw / 100
+    return raw
+
+def fmt(v):
+    """Format a dollar value with comma thousands separator, no decimals."""
+    if v is None:
+        return "N/A"
+    return f"${v:,.0f}"
+
+def safe(lst, i, default=0):
+    try:
+        v = lst[i]
+        return v if v is not None else default
+    except Exception:
+        return default
+
+
+# ─────────────────────────────────────────────
 # HOME PAGE
 # ─────────────────────────────────────────────
 def home_page():
@@ -125,10 +152,8 @@ def upload_page():
                     st.session_state.financials = financials
                     st.session_state.company_name = financials.get("company_name", "Company")
                     st.session_state.confirmed = False
-                    st.success("✓ Extraction complete! Review the data on the next page.")
-                    if st.button("→ Review Data", use_container_width=True):
-                        st.session_state.page = "preview"
-                        st.rerun()
+                    st.session_state.page = "preview"
+                    st.rerun()
                 except Exception as e:
                     st.error(f"Extraction failed: {str(e)}")
                     st.markdown(
@@ -278,20 +303,6 @@ def preview_page():
     bs = fin.get("balance_sheet", {})
     wacc_in = fin.get("wacc_inputs", {})
 
-    def safe(lst, i, default=0):
-        try:
-            v = lst[i]
-            return v if v is not None else default
-        except Exception:
-            return default
-
-    def fmt(v):
-        if v is None:
-            return "N/A"
-        if abs(v) >= 1000:
-            return f"{v:,.0f}"
-        return f"{v:.1f}"
-
     with tab1:
         st.markdown("#### Income Statement")
         rows = [
@@ -316,9 +327,9 @@ def preview_page():
             cells += "".join(f"<td>{fmt(safe(vals, i))}</td>" for i in range(3))
             rows_html += f"<tr class='{row_class}'>{cells}</tr>"
 
-        # Tax rate row
-        tax_rate = inc.get("tax_rate", 0) or 0
-        rows_html += f"<tr><td style='color:#8892a4;font-family:Inter,sans-serif;font-size:0.84rem;'>Effective Tax Rate</td><td colspan='3' style='color:#c8d0e0;'>{tax_rate*100:.1f}%</td></tr>"
+        # Tax rate row — normalize before display
+        tax_rate_display = normalize_tax(inc.get("tax_rate", 0.21)) * 100
+        rows_html += f"<tr><td style='color:#8892a4;font-family:Inter,sans-serif;font-size:0.84rem;'>Effective Tax Rate</td><td colspan='3' style='color:#c8d0e0;'>{tax_rate_display:.1f}%</td></tr>"
 
         st.markdown(f"""
         <table>
@@ -338,10 +349,7 @@ def preview_page():
             new_ni = st.number_input("Net Income ($M)", value=float(safe(inc.get("net_income", [0,0,0]), 2)), step=100.0)
         with c3:
             new_da = st.number_input("D&A ($M)", value=float(safe(inc.get("depreciation_amortization", [0,0,0]), 2)), step=50.0)
-            raw_tax = float(inc.get("tax_rate") or 0.21)
-            # Normalize: Claude sometimes returns 21 instead of 0.21
-            tax_display = raw_tax if raw_tax > 1 else raw_tax * 100
-            tax_display = max(0.0, min(tax_display, 60.0))
+            tax_display = round(normalize_tax(inc.get("tax_rate")) * 100, 2)
             new_tax = st.number_input("Tax Rate (%)", value=tax_display, step=0.5, min_value=0.0, max_value=60.0)
 
         # Push edits back
@@ -457,8 +465,7 @@ def preview_page():
             new_dw = st.number_input("Debt Weight (%)", value=float((wacc_in.get("debt_weight") or 0.35) * 100), step=1.0, min_value=0.0, max_value=100.0)
             new_ew = st.number_input("Equity Weight (%)", value=100 - float((wacc_in.get("debt_weight") or 0.35) * 100), step=1.0, min_value=0.0, max_value=100.0)
 
-        raw_tr = fin["income_statement"].get("tax_rate") or 0.21
-        tax_rate = raw_tr / 100 if raw_tr > 1 else raw_tr
+        tax_rate = normalize_tax(fin["income_statement"].get("tax_rate"))
         auto_wacc = (new_ew / 100) * (new_rfr / 100 + new_beta * new_mrp / 100) + \
                     (new_dw / 100) * (new_cod / 100) * (1 - tax_rate)
 
@@ -509,20 +516,12 @@ def dcf_page():
     bs = fin.get("balance_sheet", {})
     wacc_in = fin.get("wacc_inputs", {})
 
-    def safe(lst, i, default=0):
-        try:
-            v = lst[i]
-            return v if v is not None else default
-        except Exception:
-            return default
-
     base_revenue = safe(inc.get("revenue", [0,0,0]), 2)
     base_ebitda = safe(inc.get("ebitda", [0,0,0]), 2)
     base_da = safe(inc.get("depreciation_amortization", [0,0,0]), 2)
     base_fcf = safe(cf.get("free_cash_flow", [0,0,0]), 2)
     base_capex = safe(cf.get("capex", [0,0,0]), 2)
-    raw_tr = inc.get("tax_rate") or 0.21
-    tax_rate = raw_tr / 100 if raw_tr > 1 else raw_tr
+    tax_rate = normalize_tax(inc.get("tax_rate"))
     net_debt = bs.get("net_debt") or 0
     shares = bs.get("shares_outstanding") or 1
 
@@ -798,8 +797,14 @@ def dcf_page():
                     marker=dict(colors=["#2e7df7", "#a855f7"]),
                     textfont=dict(color="#e8edf5", size=11),
                 ))
+                pie_layout = dict(
+                    paper_bgcolor="#0f1117",
+                    plot_bgcolor="#0f1117",
+                    font=dict(family="Inter, sans-serif", color="#8892a4", size=11),
+                    margin=dict(l=40, r=40, t=40, b=40),
+                )
                 fig_pie.update_layout(
-                    **plotly_layout,
+                    **pie_layout,
                     title=dict(text=label, font=dict(color="#e8edf5", size=12)),
                     legend=dict(orientation="h", yanchor="bottom", y=-0.2, xanchor="center", x=0.5),
                     height=280,
