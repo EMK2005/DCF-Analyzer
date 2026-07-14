@@ -511,31 +511,42 @@ def dcf_page():
         return
 
     fin = st.session_state.financials
-    company = fin.get("company_name", "Company")
-    ticker = fin.get("ticker", "")
-    inc = fin.get("income_statement", {})
-    cf = fin.get("cash_flow", {})
-    bs = fin.get("balance_sheet", {})
-    wacc_in = fin.get("wacc_inputs", {})
+    company  = fin.get("company_name", "Company")
+    ticker   = fin.get("ticker", "")
+    inc      = fin.get("income_statement", {})
+    cf       = fin.get("cash_flow", {})
+    bs       = fin.get("balance_sheet", {})
+    wacc_in  = fin.get("wacc_inputs", {})
 
-    base_revenue  = safe(inc.get("revenue", [0,0,0]), 2)
-    base_ebitda   = safe(inc.get("ebitda",  [0,0,0]), 2)
-    base_da       = safe(inc.get("depreciation_amortization", [0,0,0]), 2)
-    base_fcf      = safe(cf.get("free_cash_flow", [0,0,0]), 2)
-    base_capex    = safe(cf.get("capex", [0,0,0]), 2)
-    tax_rate      = normalize_tax(inc.get("tax_rate"))
-    net_debt      = float(bs.get("net_debt") or 0)
-    shares        = float(bs.get("shares_outstanding") or 1)
+    base_revenue = safe(inc.get("revenue", [0,0,0]), 2)
+    base_ebitda  = safe(inc.get("ebitda",  [0,0,0]), 2)
+    base_da      = safe(inc.get("depreciation_amortization", [0,0,0]), 2)
+    base_fcf     = safe(cf.get("free_cash_flow", [0,0,0]), 2)
+    base_capex   = safe(cf.get("capex", [0,0,0]), 2)
+    tax_rate     = normalize_tax(inc.get("tax_rate"))
+    net_debt     = float(bs.get("net_debt") or 0)
+    shares       = float(bs.get("shares_outstanding") or 1)
 
-    beta   = float(wacc_in.get("beta") or 0.7)
-    rfr    = float(wacc_in.get("risk_free_rate") or 0.043)
-    mrp    = float(wacc_in.get("market_risk_premium") or 0.055)
-    cod    = float(wacc_in.get("cost_of_debt") or 0.04)
-    dw     = float(wacc_in.get("debt_weight") or 0.35)
-    ew     = float(wacc_in.get("equity_weight") or 0.65)
+    # Per-share data for smart price default
+    eps          = float(fin.get("per_share", {}).get("eps_diluted") or 0)
+
+    beta  = float(wacc_in.get("beta") or 0.7)
+    rfr   = float(wacc_in.get("risk_free_rate") or 0.043)
+    mrp   = float(wacc_in.get("market_risk_premium") or 0.055)
+    cod   = float(wacc_in.get("cost_of_debt") or 0.04)
+    dw    = float(wacc_in.get("debt_weight") or 0.35)
+    ew    = float(wacc_in.get("equity_weight") or 0.65)
     auto_wacc = ew * (rfr + beta * mrp) + dw * cod * (1 - tax_rate)
 
     fiscal_year = int(fin.get("fiscal_year") or 2024)
+
+    # Smart price default: use equity value / shares as a starting anchor
+    # (equity book value per share, rough proxy if market price unknown)
+    total_equity = float(bs.get("total_equity") or 0)
+    book_ps = total_equity / shares if shares else 50.0
+    # Estimate market price from EPS * typical sector P/E (15x for staples)
+    pe_estimate = eps * 20 if eps > 0 else None
+    default_price = round(pe_estimate, 2) if pe_estimate and pe_estimate > 5 else max(round(book_ps, 2), 10.0)
 
     st.markdown(f'<div class="main-header">{company} ({ticker}) — DCF Model</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="sub-header">5-Year Projection · Base Year: FY{fiscal_year} · All values in USD millions unless noted</div>', unsafe_allow_html=True)
@@ -545,36 +556,57 @@ def dcf_page():
         st.markdown("---")
         st.markdown("### ⚙️ Assumptions")
         st.markdown("**Revenue & Margins**")
-        rev_growth    = st.slider("Revenue Growth Rate (%)", 0.0, 25.0, 5.0, 0.5) / 100
-        ebitda_margin = st.slider("EBITDA Margin (%)", 5.0, 60.0,
-                                  round((base_ebitda/base_revenue*100) if base_revenue else 25.0, 1), 0.5) / 100
-        capex_pct     = st.slider("Capex (% of Revenue)", 1.0, 20.0,
-                                  round((base_capex/base_revenue*100) if base_revenue else 5.0, 1), 0.5) / 100
+
+        # Smart defaults from historical data
+        hist_rev_growth = 0.0
+        rev_hist = inc.get("revenue", [])
+        if rev_hist and len(rev_hist) >= 2 and rev_hist[0] and rev_hist[-1]:
+            try:
+                hist_rev_growth = round(((rev_hist[-1] / rev_hist[0]) ** (1/(len(rev_hist)-1)) - 1) * 100, 1)
+                hist_rev_growth = max(0.0, min(hist_rev_growth, 25.0))
+            except Exception:
+                hist_rev_growth = 5.0
+
+        rev_growth     = st.slider("Revenue Growth Rate (%)", 0.0, 25.0, float(hist_rev_growth) or 5.0, 0.5) / 100
+        default_margin = round((base_ebitda / base_revenue * 100) if base_revenue else 25.0, 1)
+        default_margin = max(5.0, min(default_margin, 60.0))
+        ebitda_margin  = st.slider("EBITDA Margin (%)", 5.0, 60.0, default_margin, 0.5) / 100
+
+        default_capex  = round((base_capex / base_revenue * 100) if base_revenue else 5.0, 1)
+        default_capex  = max(1.0, min(default_capex, 20.0))
+        capex_pct      = st.slider("Capex (% of Revenue)", 1.0, 20.0, default_capex, 0.5) / 100
         nwc_change_pct = st.slider("ΔWorking Capital (% of Revenue)", -5.0, 5.0, 1.0, 0.5) / 100
 
         st.markdown("**WACC**")
         wacc_mode = st.radio("WACC Mode", ["Auto (from filing)", "Manual override"])
         if wacc_mode == "Manual override":
-            wacc = st.slider("Manual WACC (%)", 4.0, 20.0, round(auto_wacc*100, 1), 0.25) / 100
+            wacc = st.slider("Manual WACC (%)", 4.0, 20.0, round(auto_wacc * 100, 1), 0.25) / 100
         else:
             wacc = auto_wacc
             st.markdown(f"<div style='color:#2e7df7;font-size:0.82rem;font-weight:600;'>Auto WACC: {wacc*100:.2f}%</div>", unsafe_allow_html=True)
 
         st.markdown("**Terminal Value**")
         tgr       = st.slider("Terminal Growth Rate (%)", 0.5, 5.0, 2.5, 0.25) / 100
-        exit_mult = st.slider("Exit EV/EBITDA Multiple (x)", 5.0, 25.0, 12.0, 0.5)
+        exit_mult = st.slider("Exit EV/EBITDA Multiple (x)", 5.0, 30.0, 14.0, 0.5)
 
         st.markdown("**Market Data**")
-        current_price = st.number_input("Current Share Price ($)", value=50.0, step=0.5, min_value=0.1)
+        current_price = st.number_input(
+            "Current Share Price ($)",
+            value=float(default_price),
+            step=0.5,
+            min_value=0.1,
+            help="Enter the actual current market price for upside/downside calculation"
+        )
 
     # ── MODEL CALCULATION ──
     projection_years = [fiscal_year + i + 1 for i in range(5)]
     revenues, ebitdas, fcfs, pv_fcfs = [], [], [], []
     rev = base_revenue
     for i in range(5):
-        rev = rev * (1 + rev_growth)
+        rev      = rev * (1 + rev_growth)
         ebitda_v = rev * ebitda_margin
-        da_e     = base_da * ((1 + rev_growth) ** (i + 1))
+        # D&A grows with revenue (not at a fixed rate)
+        da_e     = base_da * (rev / base_revenue) if base_revenue else base_da
         nopat    = (ebitda_v - da_e) * (1 - tax_rate)
         fcf_v    = nopat + da_e - rev * capex_pct - rev * nwc_change_pct
         revenues.append(rev)
@@ -598,186 +630,280 @@ def dcf_page():
     eq_em    = ev_em - net_debt
     px_em    = eq_em / shares if shares else 0
 
-    avg_px   = (px_gg + px_em) / 2
-    updown   = (avg_px - current_price) / current_price * 100 if current_price else 0
+    avg_px  = (px_gg + px_em) / 2
+    updown  = (avg_px - current_price) / current_price * 100 if current_price else 0
 
-    # ── BASE PLOTLY THEME (no xaxis/yaxis — add per chart) ──
+    # ── PLOTLY THEME ──
     BASE = dict(
         paper_bgcolor="#0f1117",
         plot_bgcolor="#0f1117",
         font=dict(family="Inter, sans-serif", color="#8892a4", size=11),
-        margin=dict(l=40, r=40, t=40, b=40),
+        margin=dict(l=60, r=20, t=50, b=40),
     )
-    AXIS = dict(gridcolor="#1e2535", linecolor="#1e2535", tickfont=dict(color="#8892a4"))
+    AXIS   = dict(gridcolor="#1e2535", linecolor="#1e2535", tickfont=dict(color="#8892a4"))
     LEGEND = dict(bgcolor="#161b27", bordercolor="#1e2535", borderwidth=1)
+
+    def fmt_axis(v):
+        """Format axis tick values as $XB or $XM — no 'k' abbreviation."""
+        if abs(v) >= 1_000_000:
+            return f"${v/1_000_000:.0f}T"
+        if abs(v) >= 1_000:
+            return f"${v/1_000:.0f}B"
+        return f"${v:.0f}M"
 
     # ── SUMMARY METRICS ──
     m1, m2, m3, m4, m5 = st.columns(5)
-    for col, label, value, delta_val, delta_label in [
-        (m1, "WACC",               f"{wacc*100:.2f}%",      None,                        None),
-        (m2, "Implied Price (GGM)",f"${px_gg:,.2f}",        px_gg - current_price,       "vs market"),
-        (m3, "Implied Price (Exit×)",f"${px_em:,.2f}",      px_em - current_price,       "vs market"),
-        (m4, "Avg vs Market",      f"{updown:+.1f}%",       updown,                      f"vs ${current_price:.2f}"),
-        (m5, "PV of FCFs",         f"${pv_fcf_sum/1000:,.1f}B", None,                   None),
-    ]:
+    metrics = [
+        (m1, "WACC",                f"{wacc*100:.2f}%",        None),
+        (m2, "GGM Implied Price",   f"${px_gg:,.2f}",          px_gg - current_price),
+        (m3, "Exit× Implied Price", f"${px_em:,.2f}",          px_em - current_price),
+        (m4, "Avg Upside/Downside", f"{updown:+.1f}%",         updown),
+        (m5, "PV of FCFs",          f"${pv_fcf_sum/1000:,.1f}B", None),
+    ]
+    for col, label, value, delta in metrics:
         with col:
-            delta_html = ""
-            if delta_val is not None:
-                cls = "delta-up" if delta_val > 0 else "delta-down"
-                sym = "▲" if delta_val > 0 else "▼"
-                delta_html = f'<div class="metric-delta {cls}">{sym} ${abs(delta_val):,.2f}</div>' if delta_label == "vs market" \
-                             else f'<div class="metric-delta {cls}">{sym} {delta_label}</div>'
+            d_html = ""
+            if delta is not None:
+                cls  = "delta-up" if delta > 0 else "delta-down"
+                sym  = "▲" if delta > 0 else "▼"
+                d_html = f'<div class="metric-delta {cls}">{sym} ${abs(delta):,.2f} vs ${current_price:.2f}</div>'
             st.markdown(f"""
             <div class="metric-card">
                 <div class="metric-label">{label}</div>
                 <div class="metric-value" style="font-size:1.1rem;">{value}</div>
-                {delta_html}
+                {d_html}
             </div>""", unsafe_allow_html=True)
 
-    st.markdown("<br>", unsafe_allow_html=True)
+    # Warn if implied upside looks extreme
+    if abs(updown) > 40:
+        direction = "upside" if updown > 0 else "downside"
+        st.markdown(f"""
+        <div class="warning-box" style="margin-top:0.8rem;">
+        ⚠️ <strong>Large implied {direction} ({updown:+.1f}%)</strong> — double-check the current share price input
+        and your assumptions. For mature companies like {company}, large deviations usually signal the price
+        field needs updating, or the WACC / growth rate assumptions need review.
+        </div>""", unsafe_allow_html=True)
 
+    st.markdown("<br>")
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Projections","💰 Valuation Bridge","🗺️ Sensitivity","📋 Full Table","🧠 AI Analysis"])
 
     # ── TAB 1: PROJECTIONS ──
     with tab1:
+        yr_labels = [str(y) for y in projection_years]   # always strings → no "2,026.5"
+
         c1, c2 = st.columns(2)
         with c1:
             fig = go.Figure()
-            fig.add_trace(go.Bar(x=[str(y) for y in projection_years], y=revenues,  name="Revenue", marker_color="#2e7df7", opacity=0.85))
-            fig.add_trace(go.Bar(x=[str(y) for y in projection_years], y=ebitdas,   name="EBITDA",  marker_color="#22c55e", opacity=0.85))
-            fig.update_layout(**BASE, barmode="group",
-                              xaxis=AXIS, yaxis={**AXIS, "tickprefix":"$","ticksuffix":"M"}, legend=LEGEND,
-                              title=dict(text="Revenue & EBITDA", font=dict(color="#e8edf5", size=13)))
+            fig.add_trace(go.Bar(x=yr_labels, y=revenues, name="Revenue", marker_color="#2e7df7", opacity=0.85))
+            fig.add_trace(go.Bar(x=yr_labels, y=ebitdas,  name="EBITDA",  marker_color="#22c55e", opacity=0.85))
+            fig.update_layout(
+                **BASE, barmode="group", legend=LEGEND,
+                xaxis={**AXIS, "type":"category"},
+                yaxis={**AXIS, "tickformat":"$,.0f", "ticksuffix":"M"},
+                title=dict(text="Revenue & EBITDA ($M)", font=dict(color="#e8edf5", size=13)),
+            )
             st.plotly_chart(fig, use_container_width=True)
 
         with c2:
             fig2 = go.Figure()
-            fig2.add_trace(go.Scatter(x=[str(y) for y in projection_years], y=fcfs,    name="FCF",       line=dict(color="#f59e0b", width=2.5), mode="lines+markers", marker=dict(size=7)))
-            fig2.add_trace(go.Scatter(x=[str(y) for y in projection_years], y=pv_fcfs, name="PV of FCF", line=dict(color="#a855f7", width=2.5, dash="dot"), mode="lines+markers", marker=dict(size=7)))
-            fig2.update_layout(**BASE,
-                               xaxis=AXIS, yaxis={**AXIS, "tickprefix":"$","ticksuffix":"M"}, legend=LEGEND,
-                               title=dict(text="FCF vs Present Value", font=dict(color="#e8edf5", size=13)))
+            fig2.add_trace(go.Scatter(x=yr_labels, y=fcfs,    name="FCF",
+                           line=dict(color="#f59e0b", width=2.5), mode="lines+markers", marker=dict(size=7, color="#f59e0b")))
+            fig2.add_trace(go.Scatter(x=yr_labels, y=pv_fcfs, name="PV of FCF",
+                           line=dict(color="#a855f7", width=2.5, dash="dot"), mode="lines+markers", marker=dict(size=7, color="#a855f7")))
+            fig2.update_layout(
+                **BASE, legend=LEGEND,
+                xaxis={**AXIS, "type":"category"},
+                yaxis={**AXIS, "tickformat":"$,.0f", "ticksuffix":"M"},
+                title=dict(text="FCF vs Present Value ($M)", font=dict(color="#e8edf5", size=13)),
+            )
             st.plotly_chart(fig2, use_container_width=True)
 
-        margins = [e/r*100 for e,r in zip(ebitdas, revenues)]
+        # EBITDA Margin — each year computed from its own revenue/ebitda pair
+        # Since ebitda_margin slider is constant, show historical + projection together
+        hist_rev  = inc.get("revenue", [])
+        hist_ebit = inc.get("ebitda",  [])
+        hist_yrs  = fin.get("years", [])
+
+        hist_margins = []
+        for r, e in zip(hist_rev, hist_ebit):
+            if r and e and r != 0:
+                hist_margins.append(round(e / r * 100, 2))
+            else:
+                hist_margins.append(None)
+
+        proj_margins = [round(ebitda_margin * 100, 2)] * 5   # flat by assumption — show clearly
+
+        all_yrs     = list(hist_yrs) + yr_labels
+        all_margins = hist_margins   + proj_margins
+
         fig3 = go.Figure()
-        fig3.add_trace(go.Scatter(x=[str(y) for y in projection_years], y=margins,
-                                  fill="tozeroy", fillcolor="rgba(46,125,247,0.12)",
-                                  line=dict(color="#2e7df7", width=2), name="EBITDA Margin %"))
-        fig3.update_layout(**BASE,
-                           xaxis=AXIS, yaxis={**AXIS, "ticksuffix":"%"}, legend=LEGEND,
-                           title=dict(text="EBITDA Margin Evolution", font=dict(color="#e8edf5", size=13)), height=250)
+        if hist_margins:
+            fig3.add_trace(go.Scatter(
+                x=list(hist_yrs), y=hist_margins, name="Historical",
+                line=dict(color="#5a6478", width=2, dash="dot"),
+                mode="lines+markers", marker=dict(size=6, color="#5a6478"),
+            ))
+        fig3.add_trace(go.Scatter(
+            x=yr_labels, y=proj_margins, name=f"Projected ({ebitda_margin*100:.1f}% assumption)",
+            fill="tozeroy", fillcolor="rgba(46,125,247,0.10)",
+            line=dict(color="#2e7df7", width=2),
+            mode="lines+markers", marker=dict(size=6, color="#2e7df7"),
+        ))
+        # Dynamic y-axis range
+        valid = [m for m in all_margins if m is not None]
+        ymin  = max(0, min(valid) - 5) if valid else 0
+        ymax  = max(valid) + 5 if valid else 50
+        fig3.update_layout(
+            **BASE, legend=LEGEND,
+            xaxis={**AXIS, "type":"category"},
+            yaxis={**AXIS, "ticksuffix":"%", "range":[ymin, ymax]},
+            title=dict(text="EBITDA Margin % — Historical vs Projected", font=dict(color="#e8edf5", size=13)),
+            height=280,
+        )
         st.plotly_chart(fig3, use_container_width=True)
+
+        st.markdown(
+            '<div class="info-box" style="font-size:0.8rem;">ℹ️ The projected margin is flat because EBITDA Margin is a single assumption slider. '
+            'Adjust it in the sidebar to model margin expansion or compression.</div>',
+            unsafe_allow_html=True,
+        )
 
     # ── TAB 2: VALUATION BRIDGE ──
     with tab2:
         c1, c2 = st.columns(2)
-        wf_measure = ["relative","relative","total","relative","total"]
-        wf_labels  = ["PV of FCFs","PV of Terminal Value","Enterprise Value","Less: Net Debt","Equity Value"]
+        wf_measure = ["relative", "relative", "total", "relative", "total"]
+        wf_labels  = ["PV of FCFs", "PV of Terminal Value", "Enterprise Value", "Less: Net Debt", "Equity Value"]
 
-        for col, (title, pv_tv, ev, eq, px_val) in zip([c1,c2],[
+        for col, (title, pv_tv, ev, eq, px_val) in zip([c1, c2], [
             ("Gordon Growth (GGM)", pv_tv_gg, ev_gg, eq_gg, px_gg),
             ("Exit EV/EBITDA",      pv_tv_em, ev_em, eq_em, px_em),
         ]):
             with col:
+                wf_y = [pv_fcf_sum, pv_tv, 0, -net_debt, 0]
+
+                # Build custom text — for "total" bars show the actual computed total
+                wf_text = []
+                running = 0.0
+                for m, v in zip(wf_measure, [pv_fcf_sum, pv_tv, ev, -net_debt, eq]):
+                    if m == "total":
+                        wf_text.append(f"${v:,.0f}M")
+                    else:
+                        wf_text.append(f"${v:,.0f}M")
+
                 fig_wf = go.Figure(go.Waterfall(
-                    orientation="v", measure=wf_measure, x=wf_labels,
-                    y=[pv_fcf_sum, pv_tv, 0, -net_debt, 0],
-                    connector=dict(line=dict(color="#1e2535")),
+                    orientation="v",
+                    measure=wf_measure,
+                    x=wf_labels,
+                    y=wf_y,
+                    text=wf_text,
+                    textposition="outside",
+                    textfont=dict(color="#e8edf5", size=10),
+                    connector=dict(line=dict(color="#1e2535", width=1)),
                     increasing=dict(marker_color="#22c55e"),
                     decreasing=dict(marker_color="#ef4444"),
                     totals=dict(marker_color="#2e7df7"),
-                    texttemplate="%{y:,.0f}", textfont=dict(color="#e8edf5", size=10),
                 ))
-                fig_wf.update_layout(**BASE,
-                                     xaxis=AXIS, yaxis={**AXIS, "tickprefix":"$","ticksuffix":"M"},
-                                     showlegend=False,
-                                     title=dict(text=f"{title} · Implied: ${px_val:,.2f}", font=dict(color="#22c55e", size=13)))
+                fig_wf.update_layout(
+                    **BASE,
+                    xaxis={**AXIS, "type":"category"},
+                    yaxis={**AXIS, "tickformat":"$,.0f", "ticksuffix":"M"},
+                    showlegend=False,
+                    title=dict(text=f"{title} · Implied: ${px_val:,.2f}/share", font=dict(color="#22c55e", size=13)),
+                    margin=dict(l=60, r=20, t=50, b=80),
+                )
                 st.plotly_chart(fig_wf, use_container_width=True)
 
         st.markdown("#### Value Composition")
         c1, c2 = st.columns(2)
-        for col, (label, pv_tv) in zip([c1,c2],[("GGM", pv_tv_gg),("Exit Multiple", pv_tv_em)]):
+        for col, (label, pv_tv) in zip([c1, c2], [("GGM", pv_tv_gg), ("Exit Multiple", pv_tv_em)]):
             with col:
-                # Guard against zero/negative values that break pie charts
                 fcf_slice = max(pv_fcf_sum, 0.01)
                 tv_slice  = max(pv_tv, 0.01)
+                pct_tv    = tv_slice / (fcf_slice + tv_slice) * 100
                 fig_pie = go.Figure(go.Pie(
-                    labels=["PV of FCFs", f"TV ({label})"],
+                    labels=["PV of FCFs", f"Terminal Value ({label})"],
                     values=[fcf_slice, tv_slice],
                     hole=0.55,
-                    marker=dict(colors=["#2e7df7","#a855f7"]),
+                    marker=dict(colors=["#2e7df7", "#a855f7"]),
                     textfont=dict(color="#e8edf5", size=11),
+                    textinfo="percent+label",
                 ))
                 fig_pie.update_layout(
                     paper_bgcolor="#0f1117",
                     plot_bgcolor="#0f1117",
                     font=dict(family="Inter, sans-serif", color="#8892a4", size=11),
-                    margin=dict(l=20, r=20, t=40, b=60),
-                    title=dict(text=label, font=dict(color="#e8edf5", size=12)),
-                    legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5,
-                                bgcolor="#161b27", bordercolor="#1e2535", borderwidth=1),
-                    height=280,
+                    margin=dict(l=20, r=20, t=50, b=60),
+                    title=dict(text=f"{label} · TV = {pct_tv:.0f}% of EV", font=dict(color="#e8edf5", size=12)),
+                    legend=dict(orientation="h", yanchor="bottom", y=-0.3,
+                                xanchor="center", x=0.5, bgcolor="#161b27", bordercolor="#1e2535"),
+                    height=300,
                 )
                 st.plotly_chart(fig_pie, use_container_width=True)
 
     # ── TAB 3: SENSITIVITY ──
     with tab3:
         st.markdown("#### WACC × Terminal Growth — Implied Price Heatmap")
-        wacc_rng = np.arange(max(0.04, wacc-0.04), min(0.25, wacc+0.045), 0.01)
-        tgr_rng  = np.arange(max(0.005, tgr-0.015), min(wacc-0.005, tgr+0.02), 0.005)
 
-        if len(wacc_rng) == 0: wacc_rng = np.array([wacc])
-        if len(tgr_rng)  == 0: tgr_rng  = np.array([tgr])
+        wacc_lo  = max(0.04, wacc - 0.03)
+        wacc_hi  = min(0.25, wacc + 0.035)
+        wacc_rng = np.linspace(wacc_lo, wacc_hi, 7)
 
-        def implied_px(w, g, mode):
+        tgr_lo   = max(0.005, tgr - 0.01)
+        tgr_hi   = min(wacc_lo - 0.005, tgr + 0.015)
+        if tgr_hi <= tgr_lo: tgr_hi = tgr_lo + 0.01
+        tgr_rng  = np.linspace(tgr_lo, tgr_hi, 6)
+
+        def implied_px_grid(w, g, mode):
             r = base_revenue
             fs, es = [], []
             for i in range(5):
-                r = r * (1 + rev_growth)
-                e = r * ebitda_margin
-                da_e = base_da * ((1 + rev_growth)**(i+1))
-                nopat = (e - da_e) * (1 - tax_rate)
-                fcf_v = nopat + da_e - r*capex_pct - r*nwc_change_pct
-                fs.append(fcf_v); es.append(e)
-            pv_sum = sum(f/((1+w)**(i+1)) for i,f in enumerate(fs))
+                r  = r * (1 + rev_growth)
+                e  = r * ebitda_margin
+                da = base_da * (r / base_revenue) if base_revenue else base_da
+                nopat = (e - da) * (1 - tax_rate)
+                fs.append(nopat + da - r * capex_pct - r * nwc_change_pct)
+                es.append(e)
+            pv = sum(f / ((1 + w) ** (i+1)) for i, f in enumerate(fs))
             tv = fs[-1]*(1+g)/(w-g) if (mode=="gg" and w>g) else (es[-1]*exit_mult if mode=="em" else 0)
-            return (pv_sum + tv/((1+w)**5) - net_debt) / shares if shares else 0
+            return (pv + tv/((1+w)**5) - net_debt) / shares if shares else 0
 
         hc1, hc2 = st.columns(2)
-        for col, mode, title in [(hc1,"gg","GGM"),(hc2,"em","Exit Multiple")]:
+        for col, mode, title in [(hc1,"gg","GGM"), (hc2,"em","Exit Multiple")]:
             with col:
                 try:
-                    z = np.array([[implied_px(w,g,mode) for g in tgr_rng] for w in wacc_rng])
+                    z = np.array([[implied_px_grid(w, g, mode) for g in tgr_rng] for w in wacc_rng])
                     fig_hm = go.Figure(go.Heatmap(
                         z=z,
                         x=[f"{g*100:.2f}%" for g in tgr_rng],
                         y=[f"{w*100:.1f}%" for w in wacc_rng],
                         colorscale=[[0,"#7f1d1d"],[0.3,"#ef4444"],[0.5,"#f59e0b"],[0.7,"#22c55e"],[1,"#166534"]],
                         text=np.vectorize(lambda v: f"${v:.1f}")(z),
-                        texttemplate="%{text}", textfont=dict(size=9, color="white"),
+                        texttemplate="%{text}", textfont=dict(size=10, color="white"),
+                        showscale=False,
                     ))
-                    fig_hm.update_layout(**BASE,
-                                         xaxis={**AXIS, "title":"Terminal Growth Rate"},
-                                         yaxis={**AXIS, "title":"WACC"},
-                                         title=dict(text=f"{title} · Implied $/share", font=dict(color="#e8edf5",size=12)),
-                                         height=350)
+                    fig_hm.update_layout(
+                        **BASE,
+                        xaxis={**AXIS, "title":"Terminal Growth Rate", "type":"category"},
+                        yaxis={**AXIS, "title":"WACC", "type":"category"},
+                        title=dict(text=f"{title} · Implied $/share", font=dict(color="#e8edf5", size=12)),
+                        height=320,
+                    )
                     st.plotly_chart(fig_hm, use_container_width=True)
                 except Exception as e:
-                    st.warning(f"Heatmap error ({title}): {e}")
+                    st.warning(f"Heatmap error: {e}")
 
-        st.markdown("#### Revenue Growth × EBITDA Margin — Year 5 FCF")
-        rg_rng = np.arange(0.01, 0.16, 0.02)
-        em_rng = np.arange(0.10, 0.55, 0.05)
+        st.markdown("#### Revenue Growth × EBITDA Margin — Year 5 FCF ($M)")
+        rg_rng = np.linspace(0.01, 0.15, 7)
+        em_rng = np.linspace(0.10, 0.50, 7)
         z2 = []
         for rg in rg_rng:
             row = []
             for em in em_rng:
                 r = base_revenue
-                for _ in range(5): r *= (1+rg)
-                da_e  = base_da * ((1+rg)**5)
-                nopat = (r*em - da_e)*(1-tax_rate)
-                row.append(nopat + da_e - r*capex_pct - r*nwc_change_pct)
+                for _ in range(5): r *= (1 + rg)
+                da    = base_da * (r / base_revenue) if base_revenue else base_da
+                nopat = (r*em - da) * (1 - tax_rate)
+                row.append(nopat + da - r*capex_pct - r*nwc_change_pct)
             z2.append(row)
         z2 = np.array(z2)
         try:
@@ -788,12 +914,15 @@ def dcf_page():
                 colorscale=[[0,"#7f1d1d"],[0.4,"#f59e0b"],[1,"#166534"]],
                 text=np.vectorize(lambda v: f"${v:,.0f}M")(z2),
                 texttemplate="%{text}", textfont=dict(size=9, color="white"),
+                showscale=False,
             ))
-            fig_hm2.update_layout(**BASE,
-                                   xaxis={**AXIS,"title":"EBITDA Margin"},
-                                   yaxis={**AXIS,"title":"Revenue Growth"},
-                                   title=dict(text="Year 5 FCF · Rev Growth vs EBITDA Margin", font=dict(color="#e8edf5",size=12)),
-                                   height=320)
+            fig_hm2.update_layout(
+                **BASE,
+                xaxis={**AXIS, "title":"EBITDA Margin", "type":"category"},
+                yaxis={**AXIS, "title":"Revenue Growth", "type":"category"},
+                title=dict(text="Year 5 FCF — Revenue Growth vs EBITDA Margin", font=dict(color="#e8edf5", size=12)),
+                height=320,
+            )
             st.plotly_chart(fig_hm2, use_container_width=True)
         except Exception as e:
             st.warning(f"FCF heatmap error: {e}")
@@ -801,58 +930,71 @@ def dcf_page():
     # ── TAB 4: FULL TABLE ──
     with tab4:
         st.markdown("#### Full Projection Table")
-        base_fcf_v = safe(cf.get("free_cash_flow",[0,0,0]), 2)
         table_data = {
             "Year":           ["Base"] + [str(y) for y in projection_years],
-            "Revenue ($M)":   [f"${base_revenue:,.0f}"]  + [f"${r:,.0f}"   for r in revenues],
-            "EBITDA ($M)":    [f"${base_ebitda:,.0f}"]   + [f"${e:,.0f}"   for e in ebitdas],
-            "EBITDA Margin":  [f"{base_ebitda/base_revenue*100:.1f}%" if base_revenue else "—"] + [f"{e/r*100:.1f}%" for e,r in zip(ebitdas,revenues)],
-            "FCF ($M)":       [f"${base_fcf_v:,.0f}"]    + [f"${f:,.0f}"   for f in fcfs],
-            "PV of FCF ($M)": ["—"]                       + [f"${p:,.0f}"   for p in pv_fcfs],
+            "Revenue ($M)":   [f"${base_revenue:,.0f}"]  + [f"${r:,.0f}" for r in revenues],
+            "EBITDA ($M)":    [f"${base_ebitda:,.0f}"]   + [f"${e:,.0f}" for e in ebitdas],
+            "EBITDA Margin":  [f"{base_ebitda/base_revenue*100:.1f}%" if base_revenue else "—"] + [f"{ebitda_margin*100:.1f}%"] * 5,
+            "FCF ($M)":       [f"${base_fcf:,.0f}"]      + [f"${f:,.0f}" for f in fcfs],
+            "PV of FCF ($M)": ["—"]                       + [f"${p:,.0f}" for p in pv_fcfs],
         }
         st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
 
         st.markdown("<br>")
         st.markdown("#### Valuation Summary")
         val_data = {
-            "Method":              ["Gordon Growth (GGM)",  "Exit EV/EBITDA",       "Average"],
-            "PV of FCFs ($M)":     [f"${pv_fcf_sum:,.0f}", f"${pv_fcf_sum:,.0f}",  "—"],
-            "Terminal Value ($M)": [f"${pv_tv_gg:,.0f}",   f"${pv_tv_em:,.0f}",    "—"],
-            "Enterprise Value ($M)":[f"${ev_gg:,.0f}",     f"${ev_em:,.0f}",        "—"],
-            "Net Debt ($M)":       [f"${net_debt:,.0f}",   f"${net_debt:,.0f}",     "—"],
-            "Equity Value ($M)":   [f"${eq_gg:,.0f}",      f"${eq_em:,.0f}",        "—"],
-            "Implied Price":       [f"${px_gg:,.2f}",       f"${px_em:,.2f}",        f"${avg_px:,.2f}"],
-            "vs Market":           [
-                f"{'▲' if px_gg>current_price else '▼'} ${abs(px_gg-current_price):,.2f}",
-                f"{'▲' if px_em>current_price else '▼'} ${abs(px_em-current_price):,.2f}",
+            "Method":               ["Gordon Growth (GGM)",  "Exit EV/EBITDA",       "Average"],
+            "PV of FCFs ($M)":      [f"${pv_fcf_sum:,.0f}", f"${pv_fcf_sum:,.0f}",  "—"],
+            "Terminal Value ($M)":  [f"${pv_tv_gg:,.0f}",   f"${pv_tv_em:,.0f}",    "—"],
+            "Enterprise Value ($M)":[f"${ev_gg:,.0f}",       f"${ev_em:,.0f}",        "—"],
+            "Net Debt ($M)":        [f"${net_debt:,.0f}",    f"${net_debt:,.0f}",     "—"],
+            "Equity Value ($M)":    [f"${eq_gg:,.0f}",       f"${eq_em:,.0f}",        "—"],
+            "Implied Price/Share":  [f"${px_gg:,.2f}",       f"${px_em:,.2f}",        f"${avg_px:,.2f}"],
+            "vs Market Price":      [
+                f"{'▲' if px_gg > current_price else '▼'} ${abs(px_gg-current_price):,.2f}",
+                f"{'▲' if px_em > current_price else '▼'} ${abs(px_em-current_price):,.2f}",
                 f"{updown:+.1f}%",
             ],
         }
         st.dataframe(pd.DataFrame(val_data), use_container_width=True, hide_index=True)
-        st.markdown('<div class="warning-box" style="margin-top:1rem;">⚠️ For educational purposes only. Not investment advice.</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="warning-box" style="margin-top:1rem;">⚠️ For educational purposes only. Not investment advice. '
+            'Always verify assumptions against industry benchmarks and the original filing.</div>',
+            unsafe_allow_html=True,
+        )
 
     # ── TAB 5: AI ANALYSIS ──
     with tab5:
         st.markdown("#### 🧠 AI Analysis of the 10-K")
-        st.markdown('<div class="info-box">Claude reads the filing and produces a structured qualitative analysis. Click the button to generate.</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="info-box">Claude reads the filing and produces a structured qualitative analysis. '
+            'Click the button to generate.</div>',
+            unsafe_allow_html=True,
+        )
         st.markdown("<br>")
 
-        analysis_type = st.radio("Analysis focus",
-            ["Full Report","Risks Only","Opportunities Only","DCF Assumptions Sanity Check"],
-            horizontal=True)
+        analysis_type = st.radio(
+            "Analysis focus",
+            ["Full Report", "Risks Only", "Opportunities Only", "DCF Assumptions Sanity Check"],
+            horizontal=True,
+        )
 
         if st.button("🧠 Generate AI Analysis", type="primary"):
-            api_key   = st.session_state.get("api_key","")
+            api_key   = st.session_state.get("api_key", "")
             pdf_bytes = st.session_state.get("pdf_bytes")
             if not api_key:
                 st.error("No API key found. Go back to Home and enter your key.")
             else:
-                fin_summary = f"""Company: {company} ({ticker})
-Fiscal Year: {fiscal_year}
-Revenue: ${base_revenue:,.0f}M | EBITDA: ${base_ebitda:,.0f}M | Margin: {base_ebitda/base_revenue*100:.1f}%
-FCF: ${base_fcf:,.0f}M | Net Debt: ${net_debt:,.0f}M | Shares: {shares:,.0f}M
-Current Price: ${current_price:.2f} | DCF Avg Implied: ${avg_px:.2f} ({updown:+.1f}%)
-WACC: {wacc*100:.2f}% | Rev Growth: {rev_growth*100:.1f}%/yr | TGR: {tgr*100:.2f}% | Exit Mult: {exit_mult:.1f}x"""
+                fin_summary = (
+                    f"Company: {company} ({ticker})\n"
+                    f"Fiscal Year: {fiscal_year}\n"
+                    f"Revenue: ${base_revenue:,.0f}M | EBITDA: ${base_ebitda:,.0f}M | "
+                    f"Margin: {base_ebitda/base_revenue*100:.1f}%\n"
+                    f"FCF: ${base_fcf:,.0f}M | Net Debt: ${net_debt:,.0f}M | Shares: {shares:,.0f}M\n"
+                    f"Current Price: ${current_price:.2f} | DCF Avg Implied: ${avg_px:.2f} ({updown:+.1f}%)\n"
+                    f"WACC: {wacc*100:.2f}% | Rev Growth: {rev_growth*100:.1f}%/yr | "
+                    f"TGR: {tgr*100:.2f}% | Exit Mult: {exit_mult:.1f}x"
+                )
 
                 prompts = {
                     "Full Report": f"""You are a senior equity analyst. Based on the 10-K filing for {company}, write a structured investment analysis.
@@ -860,40 +1002,40 @@ WACC: {wacc*100:.2f}% | Rev Growth: {rev_growth*100:.1f}%/yr | TGR: {tgr*100:.2f
 Financial context:
 {fin_summary}
 
-Use these markdown headers:
+Use these sections:
 ## Executive Summary
 ## Business Model & Competitive Position
 ## Key Risks (top 5, with severity High/Medium/Low)
 ## Growth Opportunities (top 4-5, be specific)
 ## Financial Health Assessment
-## DCF Assumptions Sanity Check (comment on {rev_growth*100:.1f}% growth, {wacc*100:.2f}% WACC, {tgr*100:.2f}% TGR)
+## DCF Assumptions Sanity Check (comment on {rev_growth*100:.1f}% growth, {wacc*100:.2f}% WACC, {tgr*100:.2f}% TGR, {exit_mult:.1f}x exit)
 ## Key Things to Watch (next 12-24 months)""",
 
                     "Risks Only": f"""Senior equity analyst. Identify and analyze the top 7 material risks from {company}'s 10-K.
 
 Context: {fin_summary}
 
-For each risk: name, severity (H/M/L), what it is, company-specific exposure, mitigants.
+For each: name, severity (H/M/L), description, company-specific exposure, mitigants.
 Group by: Operational, Financial, Regulatory, Market/Competitive, Macro.""",
 
                     "Opportunities Only": f"""Growth analyst. Identify the top 6 growth opportunities from {company}'s 10-K.
 
 Context: {fin_summary}
 
-For each: name, description, timeline (1-2yr/3-5yr/5yr+), revenue/margin impact, execution risks.
+For each: name, description, timeline (1-2yr / 3-5yr / 5yr+), revenue/margin impact, execution risks.
 End with your top 2 highest-probability opportunities.""",
 
                     "DCF Assumptions Sanity Check": f"""Valuation expert. Critically evaluate these DCF assumptions against {company}'s 10-K:
 
 {fin_summary}
 
-Evaluate each:
-### Revenue Growth ({rev_growth*100:.1f}%/yr) — reasonable?
-### EBITDA Margin ({ebitda_margin*100:.1f}%) — sustainable?
-### WACC ({wacc*100:.2f}%) — appropriate?
-### Terminal Growth Rate ({tgr*100:.2f}%) — fair?
-### Exit Multiple ({exit_mult:.1f}x EV/EBITDA) — justified?
-### Verdict: bull/base/bear implied prices and whether ${current_price:.2f} looks attractive""",
+### Revenue Growth ({rev_growth*100:.1f}%/yr) — reasonable given history and industry?
+### EBITDA Margin ({ebitda_margin*100:.1f}%) — sustainable or achievable?
+### WACC ({wacc*100:.2f}%) — appropriate for this company's risk profile?
+### Terminal Growth Rate ({tgr*100:.2f}%) — fair long-run assumption?
+### Exit Multiple ({exit_mult:.1f}x EV/EBITDA) — justified vs. sector peers?
+### Implied Price vs Market: The DCF gives ${avg_px:.2f} vs market ${current_price:.2f} ({updown:+.1f}%). Explain what's driving this gap.
+### Verdict: bull / base / bear implied prices and what assumptions drive each.""",
                 }
 
                 with st.spinner("Generating analysis... 15–30 seconds."):
@@ -902,14 +1044,18 @@ Evaluate each:
                         client = ant.Anthropic(api_key=api_key)
                         if pdf_bytes:
                             pdf_b64 = base64.b64encode(pdf_bytes).decode("ascii")
-                            messages = [{"role":"user","content":[
-                                {"type":"document","source":{"type":"base64","media_type":"application/pdf","data":pdf_b64}},
-                                {"type":"text","text":prompts[analysis_type]},
+                            messages = [{"role": "user", "content": [
+                                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64}},
+                                {"type": "text", "text": prompts[analysis_type]},
                             ]}]
                         else:
-                            messages = [{"role":"user","content":prompts[analysis_type]}]
+                            messages = [{"role": "user", "content": prompts[analysis_type]}]
 
-                        resp = client.messages.create(model="claude-sonnet-4-6", max_tokens=2500, messages=messages)
+                        resp = client.messages.create(
+                            model="claude-sonnet-4-6",
+                            max_tokens=2500,
+                            messages=messages,
+                        )
                         st.session_state["last_analysis"]      = resp.content[0].text
                         st.session_state["last_analysis_type"] = analysis_type
                     except Exception as e:
@@ -917,12 +1063,20 @@ Evaluate each:
 
         if st.session_state.get("last_analysis"):
             st.markdown("---")
-            st.markdown(f'<div class="status-badge badge-done">✓ {st.session_state.get("last_analysis_type","Analysis")} generated</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="status-badge badge-done">✓ {st.session_state.get("last_analysis_type","Analysis")} generated</div>',
+                unsafe_allow_html=True,
+            )
             st.markdown("<br>")
             st.markdown(st.session_state["last_analysis"])
             st.markdown("<br>")
-            st.download_button("⬇️ Download as .txt",
+            st.download_button(
+                "⬇️ Download as .txt",
                 data=st.session_state["last_analysis"],
                 file_name=f"{company}_{st.session_state.get('last_analysis_type','analysis').replace(' ','_')}.txt",
-                mime="text/plain")
-            st.markdown('<div class="warning-box" style="margin-top:1rem;">⚠️ AI-generated. Not investment advice.</div>', unsafe_allow_html=True)
+                mime="text/plain",
+            )
+            st.markdown(
+                '<div class="warning-box" style="margin-top:1rem;">⚠️ AI-generated. Not investment advice.</div>',
+                unsafe_allow_html=True,
+            )
